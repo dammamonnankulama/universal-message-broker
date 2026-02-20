@@ -19,9 +19,11 @@ import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.ApplicationContext;
+import org.springframework.context.EmbeddedValueResolverAware;
 import org.springframework.core.annotation.AnnotationUtils;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
+import org.springframework.util.StringValueResolver;
 
 import java.lang.reflect.Method;
 import java.util.Map;
@@ -60,7 +62,7 @@ import java.util.concurrent.TimeUnit;
 @ConditionalOnProperty(prefix = "messaging", name = "provider", havingValue = "azure")
 @ConditionalOnClass(ServiceBusProcessorClient.class)
 public class AzureManualAckListenerProcessor
-        implements SmartInitializingSingleton, DisposableBean {
+        implements SmartInitializingSingleton, DisposableBean, EmbeddedValueResolverAware {
 
     private final AzureProperties azureProperties;
     private final MessagingProperties properties;
@@ -74,6 +76,17 @@ public class AzureManualAckListenerProcessor
     /** Active Azure processors keyed by subscription name. */
     private final Map<String, ServiceBusProcessorClient> processors =
             new ConcurrentHashMap<>();
+
+    private StringValueResolver resolver;
+
+    @Override
+    public void setEmbeddedValueResolver(StringValueResolver resolver) {
+        this.resolver = resolver;
+    }
+
+    private String resolve(String value) {
+        return (resolver != null && value != null) ? resolver.resolveStringValue(value) : value;
+    }
 
     private static final int DEFAULT_CONCURRENCY = 5;
 
@@ -111,7 +124,7 @@ public class AzureManualAckListenerProcessor
             return;
         }
 
-        String logicalTopic = listener.topic();
+        String logicalTopic = resolve(listener.topic());
         String topicName =
                 properties.getTopics().getOrDefault(logicalTopic, logicalTopic);
 
@@ -129,7 +142,8 @@ public class AzureManualAckListenerProcessor
 
             validateHandlerSignature(clazz, method);
 
-            String subscription = resolveSubscription(logicalTopic);
+            String channel = listener.channel();
+            String subscription = resolveSubscription(logicalTopic, channel);
 
             String processorKey = subscription + "#" + method.getName();
 
@@ -322,15 +336,15 @@ public class AzureManualAckListenerProcessor
         processors.clear();
     }
 
-    private String resolveSubscription(String logicalTopic) {
-        return azureProperties.getSubscriptions()
-                .values()
-                .stream()
-                .filter(sub -> sub.getTopic().equals(logicalTopic))
-                .findFirst()
-                .map(AzureProperties.SubscriptionConfig::getName)
-                .orElseThrow(() -> new IllegalStateException(
-                        "No Azure subscription configured for logical topic: " + logicalTopic
-                ));
+    private String resolveSubscription(String logicalTopic, String channel) {
+        AzureProperties.SubscriptionConfig config = azureProperties.getSubscriptions().get(channel);
+
+        if (config != null) {
+            if (config.getName() != null && !config.getName().isBlank()) {
+                return resolve(config.getName());
+            }
+        }
+
+        return resolve(channel) + "-sub";
     }
 }

@@ -18,8 +18,10 @@ import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.ApplicationContext;
+import org.springframework.context.EmbeddedValueResolverAware;
 import org.springframework.core.annotation.AnnotationUtils;
 import org.springframework.stereotype.Component;
+import org.springframework.util.StringValueResolver;
 
 import java.lang.reflect.Method;
 import java.util.Map;
@@ -57,7 +59,7 @@ import java.util.concurrent.TimeUnit;
 @ConditionalOnProperty(prefix = "messaging", name = "provider", havingValue = "rabbitmq")
 @ConditionalOnClass(SimpleMessageListenerContainer.class)
 public class RabbitManualAckListenerProcessor
-        implements SmartInitializingSingleton, DisposableBean {
+        implements SmartInitializingSingleton, DisposableBean, EmbeddedValueResolverAware {
 
     private final MessagingProperties properties;
     private final ApplicationContext context;
@@ -70,6 +72,17 @@ public class RabbitManualAckListenerProcessor
     /** Active listener containers keyed by queue name. */
     private final Map<String, SimpleMessageListenerContainer> containers =
             new ConcurrentHashMap<>();
+
+    private StringValueResolver resolver;
+
+    @Override
+    public void setEmbeddedValueResolver(StringValueResolver resolver) {
+        this.resolver = resolver;
+    }
+
+    private String resolve(String value) {
+        return (resolver != null && value != null) ? resolver.resolveStringValue(value) : value;
+    }
 
     private static final int DEFAULT_PREFETCH = 10;
 
@@ -108,7 +121,7 @@ public class RabbitManualAckListenerProcessor
             return;
         }
 
-        String logicalTopic = listener.topic();
+        String logicalTopic = resolve(listener.topic());
         String exchange =
                 properties.getTopics().getOrDefault(logicalTopic, logicalTopic);
 
@@ -121,8 +134,8 @@ public class RabbitManualAckListenerProcessor
 
             validateHandlerSignature(clazz, method);
 
-            String routingKey = logicalTopic + "." + handler.value();
-            String queueName = listener.channel() + ".queue";
+            String routingKey = logicalTopic + "." + resolve(handler.value());
+            String queueName = resolve(listener.channel()) + ".queue";
             int prefetch = listener.prefetch();
 
             registerQueueAndContainer(
