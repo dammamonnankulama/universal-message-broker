@@ -6,7 +6,9 @@ import com.azure.identity.DefaultAzureCredentialBuilder;
 import com.azure.messaging.servicebus.ServiceBusClientBuilder;
 import com.azure.messaging.servicebus.administration.ServiceBusAdministrationClient;
 import com.azure.messaging.servicebus.administration.ServiceBusAdministrationClientBuilder;
+import com.azure.messaging.servicebus.administration.models.CreateSubscriptionOptions;
 import com.intteq.universal.message.broker.MessagingProperties;
+import com.intteq.universal.message.broker.annotation.MessagingListener;
 import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
@@ -15,10 +17,12 @@ import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.ApplicationContext;
+import org.springframework.context.EmbeddedValueResolverAware;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.annotation.Order;
 import org.springframework.lang.Nullable;
+import org.springframework.util.StringValueResolver;
 
 import java.security.SecureRandom;
 import java.time.Duration;
@@ -58,7 +62,7 @@ import java.time.Duration;
 @RequiredArgsConstructor
 @Order(0) // MUST execute before Azure listeners
 @ConditionalOnProperty(name = "messaging.provider", havingValue = "azure")
-public class AzureInfrastructureAutoConfig implements SmartInitializingSingleton {
+public class AzureInfrastructureAutoConfig implements SmartInitializingSingleton, EmbeddedValueResolverAware {
 
     /** Core messaging configuration (logical → physical topic mapping). */
     private final MessagingProperties core;
@@ -78,6 +82,17 @@ public class AzureInfrastructureAutoConfig implements SmartInitializingSingleton
     /** Fully qualified namespace (required for Managed Identity). */
     @Value("${azure.servicebus.namespace:}")
     private String namespace;
+
+    private StringValueResolver resolver;
+
+    @Override
+    public void setEmbeddedValueResolver(StringValueResolver resolver) {
+        this.resolver = resolver;
+    }
+
+    private String resolve(String value) {
+        return (resolver != null && value != null) ? resolver.resolveStringValue(value) : value;
+    }
 
     private static final int MAX_RETRIES = 6;
     private static final Duration BASE_DELAY = Duration.ofSeconds(1);
@@ -217,26 +232,65 @@ public class AzureInfrastructureAutoConfig implements SmartInitializingSingleton
 
     /** Creates subscriptions if they do not already exist. */
     private void createSubscriptions(ServiceBusAdministrationClient admin) {
-        azureProperties.getSubscriptions().values().forEach(sub -> {
+        azureProperties.getSubscriptions().forEach((key, sub) -> {
+            String resolvedChannel = resolve(key);
+            String resolvedSubscriptionName = (sub.getName() != null && !sub.getName().isBlank())
+                    ? resolve(sub.getName())
+                    : resolvedChannel + "-sub";
 
-            String physicalTopic = core.getTopics().get(sub.getTopic());
+            String logicalTopic = sub.getTopic();
+            String physicalTopic = core.getTopics().get(logicalTopic);
+
             if (physicalTopic == null) {
-                log.warn(
-                        "Skipping subscription '{}' — logical topic '{}' not mapped",
-                        sub.getName(), sub.getTopic()
-                );
+                log.warn("Skipping subscription '{}' (key='{}') — logical topic '{}' not mapped",
+                        resolvedSubscriptionName, key, logicalTopic);
                 return;
             }
 
-            retry("CreateSubscription:" + sub.getName(), () -> {
-                if (!subscriptionExists(admin, physicalTopic, sub.getName())) {
-                    log.info(
-                            "Creating subscription '{}' on topic '{}'",
-                            sub.getName(), physicalTopic
-                    );
-                    admin.createSubscription(physicalTopic, sub.getName());
+            provisionSubscription(admin, physicalTopic, resolvedSubscriptionName, sub.getAutoDeleteOnIdle());
+        });
+
+        applicationContext.getBeansWithAnnotation(MessagingListener.class).values().forEach(bean -> {
+            MessagingListener listener = bean.getClass().getAnnotation(MessagingListener.class);
+            if (listener == null) return;
+
+            String channel = listener.channel();
+            String resolvedChannel = resolve(channel);
+
+            if (azureProperties.getSubscriptions().containsKey(channel)) {
+                return;
+            }
+
+            String logicalTopic = listener.topic();
+            String physicalTopic = core.getTopics().getOrDefault(logicalTopic, logicalTopic);
+            String resolvedSubscriptionName = resolvedChannel + "-sub";
+
+            provisionSubscription(admin, physicalTopic, resolvedSubscriptionName, null);
+        });
+    }
+
+    private void provisionSubscription(ServiceBusAdministrationClient admin, String topic, String subscription, String autoDeleteOnIdle) {
+        retry("CreateSubscription:" + subscription, () -> {
+            try {
+                if (!subscriptionExists(admin, topic, subscription)) {
+                    log.info("Creating subscription '{}' on topic '{}' (autoDeleteOnIdle={})",
+                            subscription, topic, autoDeleteOnIdle);
+
+                    CreateSubscriptionOptions options = new CreateSubscriptionOptions();
+                    if (autoDeleteOnIdle != null && !autoDeleteOnIdle.isBlank()) {
+                        try {
+                            options.setAutoDeleteOnIdle(Duration.parse(autoDeleteOnIdle));
+                        } catch (Exception e) {
+                            log.error("Invalid auto-delete-on-idle duration: {}", autoDeleteOnIdle);
+                        }
+                    }
+
+                    admin.createSubscription(topic, subscription, options);
                 }
-            });
+            } catch (Exception e) {
+                log.error("Failed to provision subscription '{}' on topic '{}'. It might be due to dynamic placeholders or permissions. Error: {}",
+                        subscription, topic, e.getMessage());
+            }
         });
     }
 
