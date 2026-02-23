@@ -21,6 +21,7 @@ import org.springframework.context.ApplicationContext;
 import org.springframework.context.EmbeddedValueResolverAware;
 import org.springframework.core.annotation.AnnotationUtils;
 import org.springframework.stereotype.Component;
+import org.springframework.util.ReflectionUtils;
 import org.springframework.util.StringValueResolver;
 
 import java.lang.reflect.Method;
@@ -125,11 +126,10 @@ public class RabbitManualAckListenerProcessor
         String exchange =
                 properties.getTopics().getOrDefault(logicalTopic, logicalTopic);
 
-        for (Method method : clazz.getDeclaredMethods()) {
-
+        ReflectionUtils.doWithMethods(clazz, method -> {
             EventHandler handler = method.getAnnotation(EventHandler.class);
             if (handler == null) {
-                continue;
+                return;
             }
 
             validateHandlerSignature(clazz, method);
@@ -146,8 +146,9 @@ public class RabbitManualAckListenerProcessor
                     method,
                     prefetch
             );
-        }
+        });
     }
+
 
     // =====================================================================
     // RABBIT REGISTRATION
@@ -225,16 +226,13 @@ public class RabbitManualAckListenerProcessor
                                         message.getBody(),
                                         method.getParameterTypes()[0]
                                 );
-
                         MessageContext mc =
                                 MessageContext.forRabbitMQ(channel, tag);
-
                         long start = System.nanoTime();
                         method.invoke(handler, payload, mc);
                         long duration = System.nanoTime() - start;
-
+                        channel.basicAck(tag, false);
                         recordSuccess(queueName, duration);
-
                     } catch (Exception ex) {
                         recordFailure(queueName);
                         log.error(
@@ -242,7 +240,6 @@ public class RabbitManualAckListenerProcessor
                                 queueName,
                                 ex
                         );
-
                         channel.basicNack(tag, false, false);
                     }
                 }
