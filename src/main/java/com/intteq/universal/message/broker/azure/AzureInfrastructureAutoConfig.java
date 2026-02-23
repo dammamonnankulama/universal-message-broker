@@ -220,14 +220,15 @@ public class AzureInfrastructureAutoConfig implements SmartInitializingSingleton
 
     /** Creates topics if they do not already exist. */
     private void createTopics(ServiceBusAdministrationClient admin) {
-        core.getTopics().forEach((logical, physical) ->
-                retry("CreateTopic:" + physical, () -> {
-                    if (!topicExists(admin, physical)) {
-                        log.info("Creating topic '{}'", physical);
-                        admin.createTopic(physical);
-                    }
-                })
-        );
+        core.getTopics().forEach((logical, physical) -> {
+            String resolvedPhysical = resolve(physical);
+            retry("CreateTopic:" + resolvedPhysical, () -> {
+                if (!topicExists(admin, resolvedPhysical)) {
+                    log.info("Creating topic '{}'", resolvedPhysical);
+                    admin.createTopic(resolvedPhysical);
+                }
+            });
+        });
     }
 
     /** Creates subscriptions if they do not already exist. */
@@ -238,7 +239,7 @@ public class AzureInfrastructureAutoConfig implements SmartInitializingSingleton
                     ? resolve(sub.getName())
                     : resolvedChannel + "-sub";
 
-            String logicalTopic = sub.getTopic();
+            String logicalTopic = resolve(sub.getTopic());
             String physicalTopic = core.getTopics().get(logicalTopic);
 
             if (physicalTopic == null) {
@@ -250,8 +251,9 @@ public class AzureInfrastructureAutoConfig implements SmartInitializingSingleton
             provisionSubscription(admin, physicalTopic, resolvedSubscriptionName, sub.getAutoDeleteOnIdle());
         });
 
-        applicationContext.getBeansWithAnnotation(MessagingListener.class).values().forEach(bean -> {
-            MessagingListener listener = bean.getClass().getAnnotation(MessagingListener.class);
+        applicationContext.getBeansWithAnnotation(MessagingListener.class).forEach((beanName, bean) -> {
+            MessagingListener listener =
+                    applicationContext.findAnnotationOnBean(beanName, MessagingListener.class);
             if (listener == null) return;
 
             String channel = listener.channel();
@@ -261,7 +263,7 @@ public class AzureInfrastructureAutoConfig implements SmartInitializingSingleton
                 return;
             }
 
-            String logicalTopic = listener.topic();
+            String logicalTopic = resolve(listener.topic());
             String physicalTopic = core.getTopics().getOrDefault(logicalTopic, logicalTopic);
             String resolvedSubscriptionName = resolvedChannel + "-sub";
 
@@ -270,8 +272,8 @@ public class AzureInfrastructureAutoConfig implements SmartInitializingSingleton
     }
 
     private void provisionSubscription(ServiceBusAdministrationClient admin, String topic, String subscription, String autoDeleteOnIdle) {
-        retry("CreateSubscription:" + subscription, () -> {
-            try {
+        try {
+            retry("CreateSubscription:" + subscription, () -> {
                 if (!subscriptionExists(admin, topic, subscription)) {
                     log.info("Creating subscription '{}' on topic '{}' (autoDeleteOnIdle={})",
                             subscription, topic, autoDeleteOnIdle);
@@ -284,14 +286,13 @@ public class AzureInfrastructureAutoConfig implements SmartInitializingSingleton
                             log.error("Invalid auto-delete-on-idle duration: {}", autoDeleteOnIdle);
                         }
                     }
-
                     admin.createSubscription(topic, subscription, options);
                 }
-            } catch (Exception e) {
-                log.error("Failed to provision subscription '{}' on topic '{}'. It might be due to dynamic placeholders or permissions. Error: {}",
-                        subscription, topic, e.getMessage());
-            }
-        });
+            });
+        } catch (Exception e) {
+                       log.error("Failed to provision subscription '{}' on topic '{}'. It might be due to dynamic placeholders or permissions.",
+                               subscription, topic, e);
+        }
     }
 
     // =====================================================

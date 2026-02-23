@@ -23,6 +23,7 @@ import org.springframework.context.EmbeddedValueResolverAware;
 import org.springframework.core.annotation.AnnotationUtils;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
+import org.springframework.util.ReflectionUtils;
 import org.springframework.util.StringValueResolver;
 
 import java.lang.reflect.Method;
@@ -133,11 +134,12 @@ public class AzureManualAckListenerProcessor
                         ? listener.concurrency()
                         : DEFAULT_CONCURRENCY;
 
-        for (Method method : clazz.getDeclaredMethods()) {
-
+        ReflectionUtils.doWithMethods(
+                clazz,
+            method -> {
             EventHandler handler = method.getAnnotation(EventHandler.class);
             if (handler == null) {
-                continue;
+                    return;
             }
 
             validateHandlerSignature(clazz, method);
@@ -158,6 +160,7 @@ public class AzureManualAckListenerProcessor
                     )
             );
         }
+        );
     }
 
     // =====================================================================
@@ -237,6 +240,8 @@ public class AzureManualAckListenerProcessor
             long start = System.nanoTime();
             method.invoke(handler, payload, mc);
             long duration = System.nanoTime() - start;
+
+            ctx.complete();
 
             recordSuccess(subscription, duration);
 
