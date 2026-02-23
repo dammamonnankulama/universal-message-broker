@@ -144,7 +144,7 @@ public class AzureManualAckListenerProcessor
 
             validateHandlerSignature(clazz, method);
 
-            String channel = listener.channel();
+            String channel = resolve(listener.channel());
             String subscription = resolveSubscription(logicalTopic, channel);
 
             String processorKey = subscription + "#" + method.getName();
