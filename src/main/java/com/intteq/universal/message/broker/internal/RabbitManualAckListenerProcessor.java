@@ -5,6 +5,7 @@ import com.intteq.universal.message.broker.MessageContext;
 import com.intteq.universal.message.broker.MessagingProperties;
 import com.intteq.universal.message.broker.annotation.EventHandler;
 import com.intteq.universal.message.broker.annotation.MessagingListener;
+import com.intteq.universal.message.broker.rabbitmq.RabbitMQProperties;
 import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.Nullable;
 import lombok.RequiredArgsConstructor;
@@ -63,6 +64,7 @@ public class RabbitManualAckListenerProcessor
         implements SmartInitializingSingleton, DisposableBean, EmbeddedValueResolverAware {
 
     private final MessagingProperties properties;
+    private final RabbitMQProperties rabbitProperties;
     private final ApplicationContext context;
     private final ObjectMapper objectMapper;
 
@@ -72,6 +74,10 @@ public class RabbitManualAckListenerProcessor
 
     /** Active listener containers keyed by queue name. */
     private final Map<String, SimpleMessageListenerContainer> containers =
+            new ConcurrentHashMap<>();
+
+    /** Handlers registry keyed by queue name and then by routing key. */
+    private final Map<String, Map<String, HandlerMethod>> handlersByQueue =
             new ConcurrentHashMap<>();
 
     private StringValueResolver resolver;
@@ -135,7 +141,13 @@ public class RabbitManualAckListenerProcessor
             validateHandlerSignature(clazz, method);
 
             String routingKey = logicalTopic + "." + resolve(handler.value());
-            String queueName = resolve(listener.channel()) + ".queue";
+
+            String queueName = rabbitProperties.getQueues().values().stream()
+                    .filter(cfg -> routingKey.equals(cfg.getRoutingKey()))
+                    .map(RabbitMQProperties.QueueConfig::getName)
+                    .findFirst()
+                    .orElse(logicalTopic + ".auto.queue");
+
             int prefetch = listener.prefetch();
 
             registerQueueAndContainer(
@@ -155,7 +167,9 @@ public class RabbitManualAckListenerProcessor
     // =====================================================================
 
     /**
-     * Declares RabbitMQ infrastructure and starts a listener container.
+     * Registers a handler for a specific queue and routing key.
+     * The infrastructure (queue, exchange, binding) is expected to be
+     * declared by RabbitMQInfrastructureAutoConfig.
      */
     private void registerQueueAndContainer(
             String exchange,
@@ -165,24 +179,13 @@ public class RabbitManualAckListenerProcessor
             Method method,
             int requestedPrefetch
     ) {
-
-        AmqpAdmin admin = context.getBean(AmqpAdmin.class);
-
-        // Declare infrastructure idempotently
-        Queue queue = QueueBuilder.durable(queueName).build();
-        TopicExchange topicExchange = new TopicExchange(exchange, true, false);
-        Binding binding =
-                BindingBuilder.bind(queue).to(topicExchange).with(routingKey);
-
-        admin.declareQueue(queue);
-        admin.declareExchange(topicExchange);
-        admin.declareBinding(binding);
+        // Register handler for the specific routing key on this queue
+        handlersByQueue.computeIfAbsent(queueName, q -> new ConcurrentHashMap<>())
+                .put(routingKey, new HandlerMethod(handler, method));
 
         containers.computeIfAbsent(queueName,
                 q -> createAndStartContainer(
                         q,
-                        handler,
-                        method,
                         requestedPrefetch
                 )
         );
@@ -194,8 +197,6 @@ public class RabbitManualAckListenerProcessor
      */
     private SimpleMessageListenerContainer createAndStartContainer(
             String queueName,
-            Object handler,
-            Method method,
             int requestedPrefetch
     ) {
 
@@ -221,6 +222,23 @@ public class RabbitManualAckListenerProcessor
                             message.getMessageProperties().getDeliveryTag();
 
                     try {
+                        String receivedRoutingKey = message.getMessageProperties().getReceivedRoutingKey();
+                        Map<String, HandlerMethod> handlers = handlersByQueue.get(queueName);
+
+                        if (handlers == null || !handlers.containsKey(receivedRoutingKey)) {
+                            log.warn(
+                                    "No handler found for routing key {} on queue {}",
+                                    receivedRoutingKey,
+                                    queueName
+                            );
+                            channel.basicAck(tag, false);
+                            return;
+                        }
+
+                        HandlerMethod handlerMethod = handlers.get(receivedRoutingKey);
+                        Object handler = handlerMethod.handler();
+                        Method method = handlerMethod.method();
+
                         Object payload =
                                 objectMapper.readValue(
                                         message.getBody(),
@@ -303,6 +321,9 @@ public class RabbitManualAckListenerProcessor
                 )
                 .increment();
     }
+
+    /** Helper to store handler instance and method. */
+    private record HandlerMethod(Object handler, Method method) {}
 
     // =====================================================================
     // SHUTDOWN
