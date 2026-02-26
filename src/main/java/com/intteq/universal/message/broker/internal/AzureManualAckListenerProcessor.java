@@ -26,6 +26,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.util.ReflectionUtils;
 import org.springframework.util.StringValueResolver;
 
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -147,7 +148,8 @@ public class AzureManualAckListenerProcessor
             String channel = resolve(listener.channel());
             String subscription = resolveSubscription(logicalTopic, channel);
 
-            String processorKey = subscription + "#" + method.getName();
+                String processorKey = subscription + "#"
+                        + method.getDeclaringClass().getName() + "#" + method.getName();
 
             processors.computeIfAbsent(
                     processorKey,
@@ -246,19 +248,20 @@ public class AzureManualAckListenerProcessor
             recordSuccess(subscription, duration);
 
         } catch (Exception ex) {
+            Throwable root = unwrapInvocationTargetException(ex);
             recordFailure(subscription);
             log.error(
                     "Azure handler failed → dead-lettering (subscription={})",
                     subscription,
-                    ex
+                    root
             );
 
             DeadLetterOptions opts =
                     new DeadLetterOptions()
                             .setDeadLetterReason("handler-exception")
                             .setDeadLetterErrorDescription(
-                                    ex.getMessage() != null
-                                            ? ex.getMessage()
+                                    root.getMessage() != null
+                                            ? root.getMessage()
                                             : "Handler execution failed"
                             );
 
@@ -278,6 +281,13 @@ public class AzureManualAckListenerProcessor
                             + " — expected (Payload, MessageContext)"
             );
         }
+    }
+
+    private Throwable unwrapInvocationTargetException(Throwable throwable) {
+        if (throwable instanceof InvocationTargetException ite && ite.getTargetException() != null) {
+            return ite.getTargetException();
+        }
+        return throwable;
     }
 
     // =====================================================================

@@ -25,6 +25,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.util.ReflectionUtils;
 import org.springframework.util.StringValueResolver;
 
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -220,6 +221,7 @@ public class RabbitManualAckListenerProcessor
 
                     long tag =
                             message.getMessageProperties().getDeliveryTag();
+                    MessageContext mc = null;
 
                     try {
                         String receivedRoutingKey = message.getMessageProperties().getReceivedRoutingKey();
@@ -244,21 +246,27 @@ public class RabbitManualAckListenerProcessor
                                         message.getBody(),
                                         method.getParameterTypes()[0]
                                 );
-                        MessageContext mc =
-                                MessageContext.forRabbitMQ(channel, tag);
+                        mc = MessageContext.forRabbitMQ(channel, tag);
                         long start = System.nanoTime();
                         method.invoke(handler, payload, mc);
                         long duration = System.nanoTime() - start;
-                        channel.basicAck(tag, false);
+                        if (!mc.isSettled()) {
+                            channel.basicAck(tag, false);
+                        }
                         recordSuccess(queueName, duration);
                     } catch (Exception ex) {
+                        Throwable root = unwrapInvocationTargetException(ex);
                         recordFailure(queueName);
                         log.error(
                                 "RabbitMQ handler failed → dead-lettering (queue={})",
                                 queueName,
-                                ex
+                                root
                         );
-                        channel.basicNack(tag, false, false);
+                        // Handler may have already settled (ack/nack/dead-letter).
+                        // Avoid double-settlement because RabbitMQ will close channel on duplicate ack/nack.
+                        if (mc == null || !mc.isSettled()) {
+                            channel.basicNack(tag, false, false);
+                        }
                     }
                 }
         );
@@ -287,6 +295,13 @@ public class RabbitManualAckListenerProcessor
                             + " — expected (Payload, MessageContext)"
             );
         }
+    }
+
+    private Throwable unwrapInvocationTargetException(Throwable throwable) {
+        if (throwable instanceof InvocationTargetException ite && ite.getTargetException() != null) {
+            return ite.getTargetException();
+        }
+        return throwable;
     }
 
     // =====================================================================
