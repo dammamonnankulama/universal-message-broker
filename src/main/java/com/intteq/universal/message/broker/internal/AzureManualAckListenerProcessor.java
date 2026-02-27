@@ -301,6 +301,13 @@ public class AzureManualAckListenerProcessor
         }
     }
 
+    private Throwable unwrapInvocationTargetException(Throwable throwable) {
+        if (throwable instanceof InvocationTargetException ite && ite.getTargetException() != null) {
+            return ite.getTargetException();
+        }
+        return throwable;
+    }
+
     // =====================================================================
     // METRICS
     // =====================================================================

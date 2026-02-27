@@ -51,6 +51,7 @@ public final class MessageContext {
     // ------------ Azure Receiver Model ------------
     private final ServiceBusReceivedMessage azureMessage;
     private final ServiceBusReceiverClient azureReceiver;
+    private final AtomicBoolean settled = new AtomicBoolean(false);
 
     // ------------ State Tracking ------------
     private final AtomicBoolean settled = new AtomicBoolean(false);
@@ -110,6 +111,14 @@ public final class MessageContext {
 
     public boolean isAzureReceiver() {
         return azureReceiver != null;
+    }
+
+    /**
+     * Returns true once this context has completed any terminal settlement
+     * operation (ack/nack/dead-letter).
+     */
+    public boolean isSettled() {
+        return settled.get();
     }
 
     // =====================================================================
