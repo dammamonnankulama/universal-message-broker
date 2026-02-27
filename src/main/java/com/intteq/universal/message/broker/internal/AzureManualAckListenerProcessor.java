@@ -26,6 +26,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.util.ReflectionUtils;
 import org.springframework.util.StringValueResolver;
 
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -147,18 +148,24 @@ public class AzureManualAckListenerProcessor
             String channel = resolve(listener.channel());
             String subscription = resolveSubscription(logicalTopic, channel);
 
-            String processorKey = subscription + "#" + method.getName();
+                String processorKey = topicName + "#" + subscription;
 
-            processors.computeIfAbsent(
-                    processorKey,
-                    s -> createAndStartProcessor(
-                            topicName,
-                            subscription,
-                            bean,
-                            method,
-                            concurrency
-                    )
-            );
+                ServiceBusProcessorClient existing = processors.get(processorKey);
+                if (existing != null) {
+                    throw new IllegalStateException(
+                            "Multiple `@EventHandler` methods mapped to Azure subscription " + processorKey
+                    );
+                }
+                processors.put(
+                        processorKey,
+                        createAndStartProcessor(
+                                topicName,
+                                subscription,
+                                bean,
+                                method,
+                                concurrency
+                        )
+                );
         }
         );
     }
@@ -226,6 +233,7 @@ public class AzureManualAckListenerProcessor
             Method method,
             String subscription
     ) {
+        MessageContext mc = null;
 
         try {
             Object payload =
@@ -234,36 +242,47 @@ public class AzureManualAckListenerProcessor
                             method.getParameterTypes()[0]
                     );
 
-            MessageContext mc =
-                    MessageContext.forAzureProcessor(ctx);
+            mc = MessageContext.forAzureProcessor(ctx);
 
             long start = System.nanoTime();
             method.invoke(handler, payload, mc);
             long duration = System.nanoTime() - start;
 
-            ctx.complete();
+            if (!mc.isSettled()) {
+                mc.ack();
+            }
 
             recordSuccess(subscription, duration);
 
         } catch (Exception ex) {
+            Throwable root = unwrapInvocationTargetException(ex);
             recordFailure(subscription);
             log.error(
                     "Azure handler failed → dead-lettering (subscription={})",
                     subscription,
-                    ex
+                    root
             );
 
             DeadLetterOptions opts =
                     new DeadLetterOptions()
                             .setDeadLetterReason("handler-exception")
                             .setDeadLetterErrorDescription(
-                                    ex.getMessage() != null
-                                            ? ex.getMessage()
+                                    root.getMessage() != null
+                                            ? root.getMessage()
                                             : "Handler execution failed"
                             );
 
-            ctx.deadLetter(opts);
+            if (mc == null || !mc.isSettled()) {
+                ctx.deadLetter(opts);
+            }
         }
+    }
+
+    private Throwable unwrapInvocationTargetException(Exception ex) {
+        if (ex instanceof InvocationTargetException && ex.getCause() != null) {
+            return ex.getCause();
+        }
+        return ex;
     }
 
     // =====================================================================
@@ -271,7 +290,9 @@ public class AzureManualAckListenerProcessor
     // =====================================================================
 
     private void validateHandlerSignature(Class<?> clazz, Method method) {
-        if (method.getParameterCount() != 2) {
+        Class<?>[] parameterTypes = method.getParameterTypes();
+        if (parameterTypes.length != 2
+                || !MessageContext.class.isAssignableFrom(parameterTypes[1])) {
             throw new IllegalStateException(
                     "Invalid @EventHandler signature: "
                             + clazz.getName() + "#" + method.getName()
